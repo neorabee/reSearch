@@ -16,6 +16,10 @@ from pdfminer.layout import LTTextContainer
 folder_path = "sources/"
 output_dir = "extracted_texts"
 
+# Chunking settings (characters, roughly 4 chars per token)
+CHUNK_MAX_CHARS = 3000   # ~500 words per chunk
+CHUNK_OVERLAP = 300      # overlap so boundary sentences stay whole in one chunk
+
 os.makedirs(output_dir, exist_ok=True)
 
 files = [
@@ -47,7 +51,7 @@ def clean_text(text):
         text
     )
 
-    # Remove trailing whitespace from lines
+    # Strip whitespace from both ends of each line
     lines = [line.strip() for line in text.split("\n")]
 
     # Collapse multiple blank lines
@@ -71,12 +75,78 @@ def clean_text(text):
 
 
 # --------------------------------------------------
+# Chunking
+# --------------------------------------------------
+
+def chunk_text(text, max_chars=CHUNK_MAX_CHARS, overlap=CHUNK_OVERLAP):
+    """
+    Split text into overlapping chunks of up to max_chars,
+    preferring to cut at paragraph boundaries.
+    """
+
+    chunks = []
+    start = 0
+
+    while start < len(text):
+
+        end = min(start + max_chars, len(text))
+
+        if end < len(text):
+            # Try to break at a paragraph boundary in the back half
+            cut = text.rfind("\n\n", start, end)
+
+            if cut <= start + max_chars // 2:
+                # Fall back to a sentence boundary
+                cut = text.rfind(". ", start, end)
+                if cut <= start + max_chars // 2:
+                    cut = end
+                else:
+                    cut += 1  # keep the period
+        else:
+            cut = end
+
+        chunk = text[start:cut].strip()
+
+        if chunk:
+            chunks.append(chunk)
+
+        if cut >= len(text):
+            break
+
+        # Step forward, keeping some overlap, but always make progress
+        start = max(cut - overlap, start + 1)
+
+    return chunks
+
+
+def make_chunks(text, document_id, page_number=None):
+    """
+    Build chunk records with traceable IDs.
+    PDF:  <docid8>_p<page>_c<n>
+    HTML: <docid8>_c<n>
+    """
+
+    prefix = document_id[:8]
+
+    if page_number is not None:
+        prefix = f"{prefix}_p{page_number}"
+
+    return [
+        {
+            "chunk_id": f"{prefix}_c{i}",
+            "text": chunk
+        }
+        for i, chunk in enumerate(chunk_text(text), start=1)
+    ]
+
+
+# --------------------------------------------------
 # PDF extraction
 # --------------------------------------------------
 
-def extract_pdf(file_path):
+def extract_pdf(file_path, document_id):
     """
-    Extract text page-by-page from a PDF.
+    Extract text page-by-page from a PDF, with chunks per page.
     """
 
     pages = []
@@ -98,7 +168,8 @@ def extract_pdf(file_path):
 
         pages.append({
             "page_number": page_number,
-            "text": page_text
+            "text": page_text,
+            "chunks": make_chunks(page_text, document_id, page_number)
         })
 
     return pages
@@ -108,9 +179,9 @@ def extract_pdf(file_path):
 # HTML extraction
 # --------------------------------------------------
 
-def extract_html(file_path):
+def extract_html(file_path, document_id):
     """
-    Extract visible text from an HTML/HTM file.
+    Extract visible text from an HTML/HTM file, with chunks.
     """
 
     with open(
@@ -138,7 +209,8 @@ def extract_html(file_path):
     text = clean_text(text)
 
     return {
-        "text": text
+        "text": text,
+        "chunks": make_chunks(text, document_id)
     }
 
 
@@ -181,7 +253,10 @@ for file in files:
 
             print("→ Extracting PDF page-by-page")
 
-            pages = extract_pdf(file)
+            pages = extract_pdf(file, document_id)
+
+            total_chunks = sum(len(p["chunks"]) for p in pages)
+            print(f"→ {len(pages)} pages, {total_chunks} chunks")
 
             document = {
                 "document_id": document_id,
@@ -204,7 +279,9 @@ for file in files:
 
             print("→ Extracting HTML")
 
-            html_data = extract_html(file)
+            html_data = extract_html(file, document_id)
+
+            print(f"→ {len(html_data['chunks'])} chunks")
 
             document = {
                 "document_id": document_id,
@@ -212,7 +289,8 @@ for file in files:
                 "file_size": file_size,
                 "mime_type": mime_type,
                 "source_type": "html",
-                "text": html_data["text"]
+                "text": html_data["text"],
+                "chunks": html_data["chunks"]
             }
 
 
@@ -237,9 +315,11 @@ for file in files:
 
         base_name = os.path.splitext(filename)[0]
 
+        # Include part of the document hash so report.pdf and
+        # report.html (or duplicate names) don't overwrite each other
         json_path = os.path.join(
             output_dir,
-            f"{base_name}.json"
+            f"{base_name}_{document_id[:8]}.json"
         )
 
         with open(
